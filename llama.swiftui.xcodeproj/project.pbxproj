@@ -384,6 +384,8 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
+				CODE_SIGN_ENTITLEMENTS = "llama.swiftui/CrucibleLLM.entitlements";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Crucible serves the local LLM API to other devices on your Wi-Fi network.";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.crucible.llmserver";
 				PRODUCT_NAME = CrucibleLLM;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
@@ -416,6 +418,8 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
+				CODE_SIGN_ENTITLEMENTS = "llama.swiftui/CrucibleLLM.entitlements";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Crucible serves the local LLM API to other devices on your Wi-Fi network.";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.crucible.llmserver";
 				PRODUCT_NAME = CrucibleLLM;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";

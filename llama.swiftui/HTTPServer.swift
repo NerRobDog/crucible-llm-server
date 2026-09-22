@@ -113,6 +113,8 @@ class HTTPServer {
 
         let method = parts[0]
         let path = parts[1]
+        let pathOnly = path.components(separatedBy: "?").first ?? path
+        let query = path.contains("?") ? String(path[path.index(after: path.firstIndex(of: "?")!)...]) : ""
 
         // CORS headers for all responses
         if method == "OPTIONS" {
@@ -124,13 +126,30 @@ class HTTPServer {
             return
         }
 
-        switch path {
+        switch pathOnly {
         case "/":
             sendResponse(connection: connection, status: "200 OK", body: "Crucible LLM Server is running")
         case "/version":
             handleVersion(connection: connection)
         case "/v1/models", "/api/tags":
             handleModels(connection: connection)
+        case "/v1/models/status", "/status":
+            handleStatus(connection: connection)
+        case "/logs":
+            let tail = Self.intParam(query, "tail") ?? 100
+            handleLogs(connection: connection, tail: tail)
+        case "/v1/models/load":
+            if method == "POST" {
+                handleLoad(request: request, connection: connection)
+            } else {
+                sendResponse(connection: connection, status: "405 Method Not Allowed", body: "{\"error\":\"Method Not Allowed\"}")
+            }
+        case "/v1/models/unload":
+            if method == "POST" {
+                handleUnload(connection: connection)
+            } else {
+                sendResponse(connection: connection, status: "405 Method Not Allowed", body: "{\"error\":\"Method Not Allowed\"}")
+            }
         case "/v1/chat/completions":
             if method == "POST" {
                 handleChatCompletion(request: request, connection: connection)
@@ -140,6 +159,14 @@ class HTTPServer {
         default:
             sendResponse(connection: connection, status: "404 Not Found", body: "{\"error\":\"Not Found\"}")
         }
+    }
+
+    private static func intParam(_ query: String, _ key: String) -> Int? {
+        for pair in query.components(separatedBy: "&") {
+            let kv = pair.components(separatedBy: "=")
+            if kv.count == 2, kv[0] == key { return Int(kv[1]) }
+        }
+        return nil
     }
 
     private func handleVersion(connection: NWConnection) {
@@ -154,10 +181,87 @@ class HTTPServer {
         sendResponse(connection: connection, status: "200 OK", body: response, contentType: "application/json")
     }
     private func handleModels(connection: NWConnection) {
-        let response = """
-        {"object":"list","data":[{"id":"local","object":"model","created":0,"owned_by":"local"}]}
-        """
-        sendResponse(connection: connection, status: "200 OK", body: response, contentType: "application/json")
+        Task {
+            let files = await self.llamaState?.availableModelFiles() ?? []
+            let loaded = await self.llamaState?.loadedModelName ?? ""
+            var models: [[String: Any]] = files.map {
+                ["id": $0, "object": "model", "created": 0, "owned_by": "local", "loaded": ($0 == loaded)]
+            }
+            // Always expose a stable "local" id for OpenAI clients that hardcode it.
+            models.append(["id": "local", "object": "model", "created": 0, "owned_by": "local", "loaded": !loaded.isEmpty])
+            self.sendJSON(connection: connection, payload: ["object": "list", "data": models])
+        }
+    }
+
+    private func handleStatus(connection: NWConnection) {
+        Task {
+            let state = await self.llamaState?.loadState.rawValue ?? "idle"
+            let model = await self.llamaState?.loadedModelName ?? ""
+            let err = await self.llamaState?.loadError ?? ""
+            let payload: [String: Any] = [
+                "state": state,
+                "model": model,
+                "error": err,
+                "load_progress": CrucibleLog.shared.progressValue(),
+                "available_memory_mb": crucibleAvailableMemoryBytes() / (1024 * 1024),
+                "physical_memory_mb": ProcessInfo.processInfo.physicalMemory / (1024 * 1024)
+            ]
+            self.sendJSON(connection: connection, payload: payload)
+        }
+    }
+
+    private func handleLoad(request: String, connection: NWConnection) {
+        guard let bodyStart = request.range(of: "\r\n\r\n")?.upperBound else {
+            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"No body\"}", contentType: "application/json")
+            return
+        }
+        let bodyString = String(request[bodyStart...])
+        guard let bodyData = bodyString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let model = json["model"] as? String, !model.isEmpty else {
+            sendResponse(connection: connection, status: "400 Bad Request",
+                         body: "{\"error\":\"'model' (filename) required\"}", contentType: "application/json")
+            return
+        }
+        let nCtx = Int32(json["n_ctx"] as? Int ?? 8192)
+        Task {
+            guard let ls = self.llamaState else {
+                self.sendResponse(connection: connection, status: "500 Internal Server Error",
+                                  body: "{\"error\":\"no state\"}", contentType: "application/json")
+                return
+            }
+            let ok = await ls.loadModelByName(model, nCtx: nCtx)
+            if ok {
+                self.sendJSON(connection: connection, status: "202 Accepted",
+                              payload: ["state": "loading", "model": model, "n_ctx": Int(nCtx)])
+            } else {
+                self.sendJSON(connection: connection, status: "404 Not Found",
+                              payload: ["error": "model file not found in Documents", "model": model])
+            }
+        }
+    }
+
+    private func handleUnload(connection: NWConnection) {
+        Task {
+            await self.llamaState?.unloadModel()
+            self.sendJSON(connection: connection, payload: ["state": "idle"])
+        }
+    }
+
+    private func handleLogs(connection: NWConnection, tail: Int) {
+        let lines = CrucibleLog.shared.tail(tail)
+        let body = lines.isEmpty ? "(no logs yet)\n" : lines.joined(separator: "\n") + "\n"
+        sendResponse(connection: connection, status: "200 OK", body: body, contentType: "text/plain")
+    }
+
+    private func sendJSON(connection: NWConnection, status: String = "200 OK", payload: [String: Any]) {
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: data, encoding: .utf8) {
+            sendResponse(connection: connection, status: status, body: s, contentType: "application/json")
+        } else {
+            sendResponse(connection: connection, status: "500 Internal Server Error",
+                         body: "{\"error\":\"serialize failed\"}", contentType: "application/json")
+        }
     }
 
     private func handleChatCompletion(request: String, connection: NWConnection) {

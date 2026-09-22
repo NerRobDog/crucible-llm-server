@@ -20,6 +20,12 @@ class LlamaState: ObservableObject {
     @Published var serverAddress = ""
     let httpServer = HTTPServer(port: 8080)
 
+    // Crucible: observable model-load state, surfaced over HTTP (/v1/models/status)
+    enum LoadState: String { case idle, loading, ready, error }
+    @Published var loadState: LoadState = .idle
+    @Published var loadedModelName: String = ""
+    @Published var loadError: String = ""
+
     private var llamaContext: LlamaContext?
     private var defaultModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-model", withExtension: "gguf", subdirectory: "models")
@@ -45,11 +51,7 @@ class LlamaState: ObservableObject {
     }
 
     private func loadDefaultModels() {
-        do {
-            try loadModel(modelUrl: defaultModelUrl)
-        } catch {
-            messageLog += "Error!\n"
-        }
+        loadModel(modelUrl: defaultModelUrl)
 
         for model in defaultModels {
             let fileURL = getDocumentsDirectory().appendingPathComponent(model.filename)
@@ -114,17 +116,76 @@ class LlamaState: ObservableObject {
             filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
         )
     ]
-    func loadModel(modelUrl: URL?) throws {
-        if let modelUrl {
-            messageLog += "Loading model...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path())
-            messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
-
-            // Assuming that the model is successfully loaded, update the downloaded models
-            updateDownloadedModels(modelName: modelUrl.lastPathComponent, status: "downloaded")
-        } else {
+    /// Kicks off a model load on a background executor (create_context is heavy and
+    /// otherwise blocks the main thread, freezing the UI and the HTTP server). State
+    /// and errors are reported via loadState/loadError/messageLog and CrucibleLog,
+    /// never swallowed into print().
+    func loadModel(modelUrl: URL?, nCtx: Int32 = 8192) {
+        guard let modelUrl else {
             messageLog += "Load a model from the list below\n"
+            return
         }
+        let name = modelUrl.lastPathComponent
+        let path = modelUrl.path(percentEncoded: false)
+
+        // Drop the previous context first so its memory is freed before we allocate
+        // the new one (critical on a 12GB device near the jetsam limit).
+        llamaContext = nil
+        loadState = .loading
+        loadError = ""
+        loadedModelName = name
+        messageLog += "Loading model \(name)...\n"
+        CrucibleLog.shared.log("[crucible] load requested: \(name) n_ctx=\(nCtx)")
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let ctx = try LlamaContext.create_context(path: path, nCtx: nCtx)
+                await MainActor.run {
+                    self.llamaContext = ctx
+                    self.loadState = .ready
+                    self.messageLog += "Loaded model \(name)\n"
+                    self.updateDownloadedModels(modelName: name, status: "downloaded")
+                }
+            } catch {
+                await MainActor.run {
+                    self.loadState = .error
+                    self.loadError = "\(error)"
+                    self.messageLog += "ERROR loading \(name): \(error)\n"
+                }
+            }
+        }
+    }
+
+    // MARK: - API-driven model management (used by the HTTP server)
+
+    /// Load a model already present in the app's Documents dir, by filename.
+    @discardableResult
+    func loadModelByName(_ filename: String, nCtx: Int32 = 8192) -> Bool {
+        let url = getDocumentsDirectory().appendingPathComponent(filename)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            CrucibleLog.shared.log("[crucible] load rejected: file not found: \(filename)")
+            return false
+        }
+        loadModel(modelUrl: url, nCtx: nCtx)
+        return true
+    }
+
+    func unloadModel() {
+        llamaContext = nil
+        loadState = .idle
+        loadedModelName = ""
+        loadError = ""
+        messageLog += "Model unloaded\n"
+        CrucibleLog.shared.log("[crucible] model unloaded")
+    }
+
+    /// Filenames of every model file sitting in Documents (what /v1/models lists).
+    func availableModelFiles() -> [String] {
+        let dir = getDocumentsDirectory()
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])) ?? []
+        return urls.map { $0.lastPathComponent }.sorted()
     }
 
 
@@ -231,12 +292,12 @@ class LlamaState: ObservableObject {
 
     private func cleanAPIOutput(_ result: String, trim: Bool) -> String {
         var cleaned = result
-        if let thinkStart = cleaned.range(of: "<think>") {
-            if let thinkEnd = cleaned.range(of: "</think>", range: thinkStart.upperBound..<cleaned.endIndex) {
-                cleaned = String(cleaned[thinkEnd.upperBound...])
-            } else {
-                cleaned = String(cleaned[..<thinkStart.lowerBound])
-            }
+        // Strip a <think>...</think> block only when it is actually closed. Dropping
+        // everything before an *unclosed* <think> (mid-generation, or a reasoning model
+        // whose CoT exceeds the token budget) wrongly yields an empty response.
+        if let thinkStart = cleaned.range(of: "<think>"),
+           let thinkEnd = cleaned.range(of: "</think>", range: thinkStart.upperBound..<cleaned.endIndex) {
+            cleaned = String(cleaned[thinkEnd.upperBound...])
         }
         if let endTag = cleaned.range(of: "<|im_end|>") {
             cleaned = String(cleaned[..<endTag.lowerBound])

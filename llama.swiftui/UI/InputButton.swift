@@ -105,11 +105,7 @@ struct InputButton: View {
                         download()
                         return
                     }
-                    do {
-                        try llamaState.loadModel(modelUrl: fileURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
-                    }
+                    llamaState.loadModel(modelUrl: fileURL)
                 }) {
                     Text("Load Custom Model")
                 }

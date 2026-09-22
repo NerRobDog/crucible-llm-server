@@ -1,8 +1,69 @@
 import Foundation
+import os
 import llama
 
 enum LlamaError: Error {
     case couldNotInitializeContext
+}
+
+// MARK: - Crucible observability
+
+/// Thread-safe ring buffer capturing llama.cpp's own logs plus Crucible events.
+/// Exposed over HTTP at /logs so clients can see exactly what happens during
+/// engine bring-up / Metal shader compilation / model load failures.
+final class CrucibleLog: @unchecked Sendable {
+    static let shared = CrucibleLog()
+    private let lock = NSLock()
+    private var lines: [String] = []
+    private let cap = 800
+    private var progress: Float = 0     // 0..1 during model weight load
+
+    func log(_ s: String) {
+        let ts = String(format: "%.3f", Date().timeIntervalSince1970)
+        lock.lock()
+        for part in s.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) where !part.isEmpty {
+            lines.append("\(ts) \(part)")
+        }
+        if lines.count > cap { lines.removeFirst(lines.count - cap) }
+        lock.unlock()
+    }
+    func setProgress(_ p: Float) { lock.lock(); progress = p; lock.unlock() }
+    func progressValue() -> Float { lock.lock(); defer { lock.unlock() }; return progress }
+    func tail(_ n: Int) -> [String] { lock.lock(); defer { lock.unlock() }; return Array(lines.suffix(max(0, n))) }
+    func clear() { lock.lock(); lines.removeAll(); progress = 0; lock.unlock() }
+}
+
+/// Bytes the app may still allocate before jetsam kills it. After Sideloadly
+/// signing, one GET /v1/models/status tells us whether the
+/// increased-memory-limit entitlement survived (large value) or was stripped.
+func crucibleAvailableMemoryBytes() -> UInt64 {
+    return UInt64(os_proc_available_memory())
+}
+
+// C-convention (non-capturing) callbacks handed to the llama.cpp C API.
+private let crucibleLogCallback: @convention(c) (ggml_log_level, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { _, text, _ in
+    guard let text = text else { return }
+    CrucibleLog.shared.log(String(cString: text))
+}
+private let crucibleProgressCallback: @convention(c) (Float, UnsafeMutableRawPointer?) -> Bool = { progress, _ in
+    CrucibleLog.shared.setProgress(progress)
+    return true   // return false here would abort the load
+}
+
+private let crucibleBackendLock = NSLock()
+private var crucibleBackendInited = false
+private var crucibleLoggingInstalled = false
+private func crucibleBootstrapLlama() {
+    crucibleBackendLock.lock()
+    defer { crucibleBackendLock.unlock() }
+    if !crucibleLoggingInstalled {
+        llama_log_set(crucibleLogCallback, nil)
+        crucibleLoggingInstalled = true
+    }
+    if !crucibleBackendInited {
+        llama_backend_init()
+        crucibleBackendInited = true
+    }
 }
 
 struct LlamaChatInput: Sendable {
@@ -60,17 +121,24 @@ actor LlamaContext {
     deinit {
         llama_sampler_free(sampling)
         llama_batch_free(batch)
+        llama_free(context)         // free context before the model it depends on
         llama_model_free(model)
-        llama_free(context)
-        llama_backend_free()
+        // NOTE: llama_backend_free() is intentionally NOT called here. The backend
+        // is process-lifetime; freeing it on a per-model unload would pull it out
+        // from under a newly-loaded model (crash on load-after-unload).
     }
 
-    static func create_context(path: String) throws -> LlamaContext {
-        llama_backend_init()
+    static func create_context(path: String, nCtx: Int32 = 8192) throws -> LlamaContext {
+        crucibleBootstrapLlama()
+        CrucibleLog.shared.setProgress(0)
+        CrucibleLog.shared.log("[crucible] load start: \((path as NSString).lastPathComponent) n_ctx=\(nCtx) avail=\(crucibleAvailableMemoryBytes() / (1024*1024))MB")
+
         var model_params = llama_model_default_params()
         model_params.n_gpu_layers = -1
         model_params.use_mmap = true
         model_params.use_mlock = false
+        model_params.progress_callback = crucibleProgressCallback
+        model_params.progress_callback_user_data = nil
 
 #if targetEnvironment(simulator)
         model_params.n_gpu_layers = 0
@@ -78,15 +146,16 @@ actor LlamaContext {
 #endif
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
-            print("Could not load model at \(path)")
+            CrucibleLog.shared.log("[crucible] ERROR: llama_model_load_from_file returned NULL — weights failed (likely OOM / jetsam limit or bad file). avail=\(crucibleAvailableMemoryBytes() / (1024*1024))MB")
             throw LlamaError.couldNotInitializeContext
         }
+        CrucibleLog.shared.log("[crucible] weights loaded, allocating context (KV/Metal)...")
 
         let n_threads = 4
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
-        ctx_params.n_ctx = 8192
+        ctx_params.n_ctx = UInt32(nCtx)
         ctx_params.n_batch = 512
         ctx_params.n_ubatch = 256
         ctx_params.n_threads = 4
@@ -100,9 +169,12 @@ actor LlamaContext {
 
         let context = llama_init_from_model(model, ctx_params)
         guard let context else {
-            print("Could not load context!")
+            CrucibleLog.shared.log("[crucible] ERROR: llama_init_from_model returned NULL — context/KV alloc failed. avail=\(crucibleAvailableMemoryBytes() / (1024*1024))MB")
+            llama_model_free(model)
             throw LlamaError.couldNotInitializeContext
         }
+        CrucibleLog.shared.setProgress(1)
+        CrucibleLog.shared.log("[crucible] context ready. avail=\(crucibleAvailableMemoryBytes() / (1024*1024))MB")
 
         return LlamaContext(model: model, context: context)
     }

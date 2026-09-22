@@ -28,13 +28,15 @@ struct LoadCustomButton: View {
                     let gotAccess = file.startAccessingSecurityScopedResource()
                     if !gotAccess { return }
 
-                    do {
-                        try llamaState.loadModel(modelUrl: file.absoluteURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                    // Copy the picked .gguf into Documents so it persists and the API
+                    // can re-load it by filename later; then load it.
+                    let dest = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent(file.lastPathComponent)
+                    if !FileManager.default.fileExists(atPath: dest.path) {
+                        try? FileManager.default.copyItem(at: file, to: dest)
                     }
-
                     file.stopAccessingSecurityScopedResource()
+                    llamaState.loadModel(modelUrl: dest)
                 }
             case .failure(let error):
                 print(error)

@@ -58,6 +58,21 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .padding(.horizontal)
 
+                HStack {
+                    switch llamaState.loadState {
+                    case .loading:
+                        ProgressView()
+                        Text("Loading \(llamaState.loadedModelName)…").font(.caption)
+                    case .ready:
+                        Text("Loaded: \(llamaState.loadedModelName)").font(.caption).foregroundColor(.green)
+                    case .error:
+                        Text("Load error: \(llamaState.loadError)").font(.caption).foregroundColor(.red)
+                    case .idle:
+                        Text("No model loaded").font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
                 NavigationLink(destination: DrawerView(llamaState: llamaState)) {
                     Text("View Models")
                 }
@@ -116,6 +131,11 @@ struct ContentView: View {
                 Section(header: Text("Download Models From Hugging Face")) {
                     HStack {
                         InputButton(llamaState: llamaState)
+                    }
+                }
+                Section(header: Text("Load From Files (.gguf)")) {
+                    HStack {
+                        LoadCustomButton(llamaState: llamaState)
                     }
                 }
                 Section(header: Text("Downloaded Models")) {
